@@ -1,0 +1,954 @@
+
+import random
+import re
+from fractions import Fraction
+from decimal import Decimal, ROUND_HALF_UP
+
+import streamlit as st
+from transformers import pipeline
+
+
+# =========================
+# PAGE SETUP
+# =========================
+st.set_page_config(
+    page_title="Guided AI Math Tutor",
+    page_icon="📘",
+    layout="wide"
+)
+
+
+# =========================
+# LIGHT CSS ONLY
+# =========================
+st.markdown("""
+<style>
+.step-box {
+    padding: 0.75rem;
+    border-radius: 10px;
+    background-color: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.10);
+    margin-bottom: 0.5rem;
+}
+.helper-box {
+    padding: 0.85rem;
+    border-radius: 10px;
+    background-color: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.08);
+    margin-bottom: 0.5rem;
+}
+.feedback-box {
+    padding: 1rem;
+    border-radius: 10px;
+    background-color: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.08);
+    margin-top: 0.75rem;
+}
+.ai-box {
+    padding: 1rem;
+    border-radius: 10px;
+    background-color: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.10);
+    margin-top: 0.75rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================
+# SESSION STATE
+# =========================
+if "problem_data" not in st.session_state:
+    st.session_state.problem_data = None
+
+if "problem_counter" not in st.session_state:
+    st.session_state.problem_counter = 0
+
+if "hint_level" not in st.session_state:
+    st.session_state.hint_level = 0
+
+if "strategy_revealed" not in st.session_state:
+    st.session_state.strategy_revealed = False
+
+
+# =========================
+# HUGGING FACE MODEL
+# =========================
+@st.cache_resource
+def load_text_generator():
+    try:
+        return pipeline("text-generation", model="distilgpt2")
+    except Exception:
+        return None
+
+
+text_generator = load_text_generator()
+
+
+# =========================
+# HELPERS
+# =========================
+def round_decimal_string(value, places):
+    quantizers = {
+        0: "1",
+        1: "0.1",
+        2: "0.01",
+        3: "0.001",
+    }
+    d = Decimal(str(value))
+    rounded = d.quantize(Decimal(quantizers[places]), rounding=ROUND_HALF_UP)
+    return format(rounded, "f")
+
+
+def format_fraction(frac):
+    if isinstance(frac, Fraction):
+        return f"{frac.numerator}/{frac.denominator}"
+    return str(frac)
+
+
+def mixed_number_string(frac):
+    sign = -1 if frac < 0 else 1
+    frac = abs(frac)
+    whole = frac.numerator // frac.denominator
+    remainder = frac.numerator % frac.denominator
+
+    if remainder == 0:
+        result = str(whole)
+    elif whole == 0:
+        result = f"{remainder}/{frac.denominator}"
+    else:
+        result = f"{whole} {remainder}/{frac.denominator}"
+
+    if sign < 0 and result != "0":
+        return f"-{result}"
+    return result
+
+
+def decimal_places_word(places):
+    words = {
+        1: "tenths",
+        2: "hundredths",
+        3: "thousandths"
+    }
+    return words.get(places, "decimal places")
+
+
+def decimal_places_plain(places):
+    plain = {
+        1: "first digit after the decimal",
+        2: "second digit after the decimal",
+        3: "third digit after the decimal"
+    }
+    return plain.get(places, "digit after the decimal")
+
+
+def get_place_value_words(number_string):
+    if "." not in number_string:
+        return []
+
+    decimal_part = number_string.split(".")[1]
+    labels = [
+        ("first digit after the decimal", "tenths"),
+        ("second digit after the decimal", "hundredths"),
+        ("third digit after the decimal", "thousandths")
+    ]
+    results = []
+
+    for i, digit in enumerate(decimal_part[:3]):
+        if i < len(labels):
+            plain_words, math_word = labels[i]
+            results.append(f"{digit} is in the {plain_words} ({math_word} place)")
+
+    return results
+
+
+def compare_fraction_answers(user_text, correct_fraction):
+    try:
+        user_text = user_text.strip()
+
+        if "/" in user_text:
+            user_fraction = Fraction(user_text)
+            return user_fraction == correct_fraction
+
+        user_decimal = Decimal(user_text)
+        correct_decimal = Decimal(str(float(correct_fraction)))
+        return abs(user_decimal - correct_decimal) < Decimal("0.001")
+    except Exception:
+        return False
+
+
+def compare_decimal_answers(user_text, correct_value, tolerance=0.001):
+    try:
+        return abs(float(user_text.strip()) - float(correct_value)) <= tolerance
+    except Exception:
+        return False
+
+
+def get_rounding_places(rounding_choice):
+    places_map = {
+        "Nearest tenth": 1,
+        "Nearest hundredth": 2,
+        "Nearest thousandth": 3
+    }
+    return places_map.get(rounding_choice)
+
+
+def reset_for_new_problem(problem):
+    st.session_state.problem_data = problem
+    st.session_state.problem_counter += 1
+    st.session_state.hint_level = 0
+    st.session_state.strategy_revealed = False
+
+
+def generic_hint_from_problem(problem):
+    if problem["type"] == "fraction":
+        return "Focus on the top number, the bottom number, and whether the answer should be simplified."
+    return "Focus on the decimal points and the digits after the decimal."
+
+
+def get_topic_feedback(topic):
+    feedback = {
+        "Decimal Addition": {
+            "mistake": "The decimal points may not be lined up.",
+            "teach": "Line up the decimal points first. Then add from right to left.",
+            "recheck": "Check the first and second digits after the decimal."
+        },
+        "Decimal Subtraction": {
+            "mistake": "The decimal points may not be lined up, or regrouping may be off.",
+            "teach": "Line up the decimal points. Then subtract from right to left. Borrow if needed.",
+            "recheck": "Check each column carefully from right to left."
+        },
+        "Decimal Multiplication": {
+            "mistake": "The decimal point may be in the wrong place.",
+            "teach": "Multiply first like whole numbers. Then count the total digits after the decimal.",
+            "recheck": "Check how many digits should be after the decimal in your answer."
+        },
+        "Decimal Division": {
+            "mistake": "The divisor may not have been changed into a whole number first.",
+            "teach": "Move the decimal to make the divisor a whole number. Move both numbers the same way.",
+            "recheck": "Check that both numbers were moved the same amount."
+        },
+        "Fraction Addition": {
+            "mistake": "The top numbers or the bottom number may have been handled the wrong way.",
+            "teach": "Add the top numbers. Keep the bottom number the same.",
+            "recheck": "Check that only the top numbers were added."
+        },
+        "Fraction Subtraction": {
+            "mistake": "The subtraction may be off, or the bottom number may have changed.",
+            "teach": "Subtract the top numbers. Keep the bottom number the same.",
+            "recheck": "Check the top-number subtraction carefully."
+        },
+        "Fraction Multiplication": {
+            "mistake": "You may not have multiplied straight across.",
+            "teach": "Multiply top times top and bottom times bottom. Then simplify.",
+            "recheck": "Check both multiplication steps."
+        },
+        "Fraction Division": {
+            "mistake": "You may not have flipped the second fraction.",
+            "teach": "Keep, change, flip. Then multiply.",
+            "recheck": "Check whether you flipped the second fraction before multiplying."
+        }
+    }
+
+    return feedback.get(topic, {
+        "mistake": "Something needs another look.",
+        "teach": "Follow the steps carefully.",
+        "recheck": "Check each part again."
+    })
+
+
+def clean_ai_text(text):
+    text = text.replace("\n", " ").replace("\r", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+
+    if not text:
+        return ""
+
+    stop_markers = [
+        "Question:",
+        "Problem:",
+        "Answer:",
+        "Student:",
+        "Tutor:",
+        "Q:",
+        "A:"
+    ]
+    for marker in stop_markers:
+        if marker in text:
+            text = text.split(marker)[0].strip()
+
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    cleaned_sentences = []
+
+    for sentence in sentences:
+        s = sentence.strip()
+
+        if not s:
+            continue
+
+        lower_s = s.lower()
+
+        if len(lower_s) < 4:
+            continue
+
+        if cleaned_sentences and lower_s == cleaned_sentences[-1].lower():
+            continue
+
+        cleaned_sentences.append(s)
+
+        if len(cleaned_sentences) == 2:
+            break
+
+    final_text = " ".join(cleaned_sentences).strip()
+    final_text = re.sub(r"\s+", " ", final_text)
+
+    return final_text
+
+
+def fallback_ai_message(problem, support_type, rounding_choice):
+    if problem["type"] == "fraction":
+        answer_text = format_fraction(problem["answer"])
+    else:
+        answer_text = str(problem["answer"])
+
+    if support_type == "success":
+        if problem["type"] == "fraction":
+            return (
+                f"You solved the {problem['topic'].lower()} problem correctly. "
+                f"The correct answer is {answer_text}, so your steps were on track."
+            )
+        return (
+            f"You solved the {problem['topic'].lower()} problem correctly. "
+            f"Your work matches the correct answer of {answer_text}."
+        )
+
+    if support_type == "mistake":
+        return (
+            f"Go slowly and focus on the key steps for {problem['topic'].lower()}. "
+            f"Use the hints and strategy to check each part before trying again."
+        )
+
+    rounding_note = ""
+    if problem["type"] == "decimal" and rounding_choice != "No rounding instruction":
+        places = get_rounding_places(rounding_choice)
+        rounding_note = f" Then round to the {decimal_places_word(places)} place if needed."
+
+    return (
+        f"For {problem['topic'].lower()}, follow the strategy one step at a time. "
+        f"Check place value, operations, and simplification carefully.{rounding_note}"
+    )
+
+
+def get_ai_support(problem, support_type, rounding_choice):
+    if text_generator is None:
+        return "AI support is not available right now. The model may still need to download the first time."
+
+    if problem["type"] == "fraction":
+        answer_text = format_fraction(problem["answer"])
+    else:
+        answer_text = str(problem["answer"])
+
+    rounding_text = ""
+    if problem["type"] == "decimal" and rounding_choice != "No rounding instruction":
+        places = get_rounding_places(rounding_choice)
+        rounding_text = (
+            f" If needed, mention rounding to the {decimal_places_word(places)} place."
+        )
+
+    if support_type == "success":
+        prompt = (
+            f"Math tutor response. "
+            f"Problem type: {problem['topic']}. "
+            f"Problem: {problem['question']}. "
+            f"Correct answer: {answer_text}. "
+            f"Write exactly 2 short sentences for a student. "
+            f"Use simple words. Be encouraging. Do not ask questions. "
+            f"Do not start a new problem.{rounding_text}"
+        )
+    elif support_type == "mistake":
+        prompt = (
+            f"Math tutor hint. "
+            f"Problem type: {problem['topic']}. "
+            f"Problem: {problem['question']}. "
+            f"Write exactly 2 short hint sentences for a student. "
+            f"Do not give the final answer. "
+            f"Use simple words. Be encouraging. "
+            f"Do not ask questions. Do not start a new problem."
+        )
+    else:
+        prompt = (
+            f"Math tutor strategy. "
+            f"Problem type: {problem['topic']}. "
+            f"Problem: {problem['question']}. "
+            f"Write exactly 2 short sentences that summarize the solving strategy. "
+            f"Use simple words. Do not give extra examples. "
+            f"Do not start a new problem.{rounding_text}"
+        )
+
+    try:
+        response = text_generator(
+            prompt,
+            max_new_tokens=35,
+            num_return_sequences=1,
+            truncation=True,
+            do_sample=False,
+            temperature=0.0,
+            pad_token_id=text_generator.tokenizer.eos_token_id
+        )
+
+        generated_text = response[0]["generated_text"]
+        ai_text = generated_text[len(prompt):].strip()
+        ai_text = clean_ai_text(ai_text)
+
+        if not ai_text or len(ai_text) < 12:
+            return fallback_ai_message(problem, support_type, rounding_choice)
+
+        return ai_text
+    except Exception:
+        return fallback_ai_message(problem, support_type, rounding_choice)
+
+
+# =========================
+# PROBLEM GENERATORS
+# =========================
+def generate_decimal_addition():
+    a = round(random.uniform(1.1, 25.9), 2)
+    b = round(random.uniform(1.1, 25.9), 2)
+    answer = round(a + b, 3)
+
+    return {
+        "type": "decimal",
+        "topic": "Decimal Addition",
+        "question": f"{a} + {b}",
+        "answer": answer,
+        "steps": [
+            "Line up the decimal points.",
+            "Add from right to left.",
+            "Bring the decimal point straight down into the answer."
+        ],
+        "vocabulary": get_place_value_words(f"{a}") + get_place_value_words(f"{b}"),
+        "hint1": "Line up the decimal points.",
+        "hint2": "Add from right to left, then bring the decimal point straight down."
+    }
+
+
+def generate_decimal_subtraction():
+    a = round(random.uniform(10.0, 30.0), 2)
+    b = round(random.uniform(1.0, 9.9), 2)
+
+    if b > a:
+        a, b = b, a
+
+    answer = round(a - b, 3)
+
+    return {
+        "type": "decimal",
+        "topic": "Decimal Subtraction",
+        "question": f"{a} - {b}",
+        "answer": answer,
+        "steps": [
+            "Line up the decimal points.",
+            "Subtract from right to left.",
+            "Regroup if needed.",
+            "Bring the decimal point straight down into the answer."
+        ],
+        "vocabulary": get_place_value_words(f"{a}") + get_place_value_words(f"{b}"),
+        "hint1": "Line up the decimal points.",
+        "hint2": "Subtract from right to left. Borrow if needed."
+    }
+
+
+def generate_decimal_multiplication():
+    a = round(random.uniform(1.1, 9.9), 2)
+    b = round(random.uniform(1.1, 9.9), 2)
+    answer = round(a * b, 3)
+
+    return {
+        "type": "decimal",
+        "topic": "Decimal Multiplication",
+        "question": f"{a} × {b}",
+        "answer": answer,
+        "steps": [
+            "Multiply as if the numbers were whole numbers.",
+            "Count the total number of digits to the right of the decimal points in both factors.",
+            "Place the decimal point in the product so it has that same total number of decimal places."
+        ],
+        "vocabulary": get_place_value_words(f"{a}") + get_place_value_words(f"{b}"),
+        "hint1": "Multiply first like whole numbers.",
+        "hint2": "Then count how many total digits are after the decimal."
+    }
+
+
+def generate_decimal_division():
+    divisor = round(random.uniform(1.1, 9.9), 1)
+    quotient = round(random.uniform(1.2, 9.5), 2)
+    dividend = round(divisor * quotient, 3)
+    answer = round(dividend / divisor, 3)
+
+    return {
+        "type": "decimal",
+        "topic": "Decimal Division",
+        "question": f"{dividend} ÷ {divisor}",
+        "answer": answer,
+        "steps": [
+            "Move the decimal point in the divisor to make it a whole number.",
+            "Move the decimal point in the dividend the same number of places.",
+            "Divide as usual.",
+            "Place the decimal point in the quotient directly above the decimal point in the dividend."
+        ],
+        "vocabulary": get_place_value_words(f"{dividend}") + get_place_value_words(f"{divisor}"),
+        "hint1": "Make the divisor a whole number first.",
+        "hint2": "Move both decimals the same amount, then divide."
+    }
+
+
+def generate_fraction_addition():
+    d = random.randint(2, 12)
+    n1 = random.randint(1, d - 1)
+    n2 = random.randint(1, d - 1)
+    f1 = Fraction(n1, d)
+    f2 = Fraction(n2, d)
+    answer = f1 + f2
+
+    return {
+        "type": "fraction",
+        "topic": "Fraction Addition",
+        "question": f"{format_fraction(f1)} + {format_fraction(f2)}",
+        "answer": answer,
+        "steps": [
+            "The denominators are already the same.",
+            "Add the numerators.",
+            "Keep the denominator the same.",
+            "Simplify if possible."
+        ],
+        "vocabulary": [
+            "Numerator: the top number",
+            "Denominator: the bottom number",
+            "Like denominators: bottom numbers that are the same"
+        ],
+        "hint1": "Add the top numbers.",
+        "hint2": "Keep the bottom number the same."
+    }
+
+
+def generate_fraction_subtraction():
+    d = random.randint(2, 12)
+    n1 = random.randint(2, d)
+    n2 = random.randint(1, n1 - 1)
+    f1 = Fraction(n1, d)
+    f2 = Fraction(n2, d)
+    answer = f1 - f2
+
+    return {
+        "type": "fraction",
+        "topic": "Fraction Subtraction",
+        "question": f"{format_fraction(f1)} - {format_fraction(f2)}",
+        "answer": answer,
+        "steps": [
+            "The denominators are already the same.",
+            "Subtract the numerators.",
+            "Keep the denominator the same.",
+            "Simplify if possible."
+        ],
+        "vocabulary": [
+            "Numerator: the top number",
+            "Denominator: the bottom number",
+            "Difference: the answer to a subtraction problem"
+        ],
+        "hint1": "Subtract the top numbers.",
+        "hint2": "Keep the bottom number the same."
+    }
+
+
+def generate_fraction_multiplication():
+    f1 = Fraction(random.randint(1, 8), random.randint(2, 9))
+    f2 = Fraction(random.randint(1, 8), random.randint(2, 9))
+    answer = f1 * f2
+
+    return {
+        "type": "fraction",
+        "topic": "Fraction Multiplication",
+        "question": f"{format_fraction(f1)} × {format_fraction(f2)}",
+        "answer": answer,
+        "steps": [
+            "Multiply the numerators.",
+            "Multiply the denominators.",
+            "Simplify if possible."
+        ],
+        "vocabulary": [
+            "Product: the answer to a multiplication problem",
+            "Simplify: write the fraction in lowest terms"
+        ],
+        "hint1": "Multiply top times top.",
+        "hint2": "Multiply bottom times bottom, then simplify."
+    }
+
+
+def generate_fraction_division():
+    f1 = Fraction(random.randint(1, 8), random.randint(2, 9))
+    f2 = Fraction(random.randint(1, 8), random.randint(2, 9))
+    answer = f1 / f2
+
+    return {
+        "type": "fraction",
+        "topic": "Fraction Division",
+        "question": f"{format_fraction(f1)} ÷ {format_fraction(f2)}",
+        "answer": answer,
+        "steps": [
+            "Keep the first fraction.",
+            "Change division to multiplication.",
+            "Flip the second fraction (find the reciprocal).",
+            "Multiply the numerators and denominators.",
+            "Simplify if possible."
+        ],
+        "vocabulary": [
+            "Reciprocal: flip the top and bottom numbers",
+            "Quotient: the answer to a division problem"
+        ],
+        "hint1": "Use keep, change, flip.",
+        "hint2": "Then multiply straight across."
+    }
+
+
+def generate_problem(topic_name):
+    generators = {
+        "Decimal Addition": generate_decimal_addition,
+        "Decimal Subtraction": generate_decimal_subtraction,
+        "Decimal Multiplication": generate_decimal_multiplication,
+        "Decimal Division": generate_decimal_division,
+        "Fraction Addition": generate_fraction_addition,
+        "Fraction Subtraction": generate_fraction_subtraction,
+        "Fraction Multiplication": generate_fraction_multiplication,
+        "Fraction Division": generate_fraction_division,
+    }
+    return generators[topic_name]()
+
+
+# =========================
+# APP HEADER
+# =========================
+st.title("Guided AI Math Tutor")
+st.write("Practice fractions and decimals with guided support, vocabulary, hints, step-by-step explanations, and Hugging Face AI support.")
+
+
+# =========================
+# SIDEBAR
+# =========================
+st.sidebar.title("Navigation")
+
+topic = st.sidebar.selectbox(
+    "Choose a topic",
+    [
+        "Decimal Addition",
+        "Decimal Subtraction",
+        "Decimal Multiplication",
+        "Decimal Division",
+        "Fraction Addition",
+        "Fraction Subtraction",
+        "Fraction Multiplication",
+        "Fraction Division"
+    ]
+)
+
+rounding_choice = st.sidebar.selectbox(
+    "For decimal division or long decimal answers, round to:",
+    ["No rounding instruction", "Nearest tenth", "Nearest hundredth", "Nearest thousandth"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Learner Prompts")
+st.sidebar.markdown("1. What is the problem asking you to find?")
+st.sidebar.markdown("2. What information do you know?")
+st.sidebar.markdown("3. What operation(s) will you perform to find the solution?")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Help Flow")
+st.sidebar.markdown("- Strategy starts hidden")
+st.sidebar.markdown("- It appears after 2 hints")
+st.sidebar.markdown("- It appears after a wrong answer")
+st.sidebar.markdown("- Or you can reveal it yourself")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### AI Tutor")
+if text_generator is None:
+    st.sidebar.warning("Hugging Face model not ready yet.")
+else:
+    st.sidebar.success("Hugging Face model loaded.")
+
+
+# =========================
+# TOPIC INTRO
+# =========================
+topic_descriptions = {
+    "Decimal Addition": "Add decimals by lining up decimal points and combining place values correctly.",
+    "Decimal Subtraction": "Subtract decimals by lining up decimal points and regrouping when needed.",
+    "Decimal Multiplication": "Multiply decimals by multiplying like whole numbers, then placing the decimal correctly.",
+    "Decimal Division": "Divide decimals by making the divisor a whole number, then dividing.",
+    "Fraction Addition": "Add fractions carefully and simplify your final answer when possible.",
+    "Fraction Subtraction": "Subtract fractions carefully and simplify your final answer when possible.",
+    "Fraction Multiplication": "Multiply across and simplify the product.",
+    "Fraction Division": "Use keep-change-flip, then multiply and simplify."
+}
+
+st.subheader(f"Current Topic: {topic}")
+st.write(topic_descriptions[topic])
+
+
+# =========================
+# BUTTONS
+# =========================
+top_col1, top_col2, top_col3 = st.columns(3)
+
+with top_col1:
+    if st.button("Generate New Problem", use_container_width=True):
+        reset_for_new_problem(generate_problem(topic))
+
+with top_col2:
+    if st.button("Give Me a Similar Problem", use_container_width=True):
+        reset_for_new_problem(generate_problem(topic))
+
+with top_col3:
+    if st.button("Clear Current Problem", use_container_width=True):
+        st.session_state.problem_data = None
+        st.session_state.hint_level = 0
+        st.session_state.strategy_revealed = False
+
+
+# =========================
+# GENERATE FIRST PROBLEM IF NEEDED
+# =========================
+if st.session_state.problem_data is None or st.session_state.problem_data["topic"] != topic:
+    reset_for_new_problem(generate_problem(topic))
+
+problem = st.session_state.problem_data
+
+
+# =========================
+# DISPLAY PROBLEM
+# =========================
+st.divider()
+st.subheader("Practice Problem")
+st.markdown(f"## {problem['question']}")
+
+
+# =========================
+# GUIDED PROMPTS
+# =========================
+with st.expander("Think Before You Solve (Optional)", expanded=False):
+    st.write("Use these prompts to guide your thinking before you answer.")
+
+    st.text_input(
+        "1. What is the problem asking you to find?",
+        key=f"find_{st.session_state.problem_counter}"
+    )
+
+    st.text_area(
+        "2. What information do you know?",
+        key=f"know_{st.session_state.problem_counter}",
+        height=100
+    )
+
+    st.text_input(
+        "3. What operation(s) will you perform?",
+        key=f"op_{st.session_state.problem_counter}"
+    )
+
+
+# =========================
+# VOCABULARY + HELP
+# =========================
+left_col, right_col = st.columns(2)
+
+with left_col:
+    st.subheader("Vocabulary")
+    for item in problem["vocabulary"]:
+        st.markdown(f"- {item}")
+
+with right_col:
+    st.subheader("Strategy")
+
+    if st.session_state.strategy_revealed:
+        for step in problem["steps"]:
+            st.markdown(f'<div class="step-box">{step}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div class="helper-box">Strategy is hidden for now. Try the problem first, ask for hints, or click <strong>Reveal Strategy</strong>.</div>',
+            unsafe_allow_html=True
+        )
+
+
+# =========================
+# ANSWER INPUT + ACTIONS
+# =========================
+st.divider()
+st.subheader("Your Answer")
+
+user_answer = st.text_input(
+    "Type your answer here",
+    key=f"answer_{st.session_state.problem_counter}"
+)
+
+action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+
+with action_col1:
+    check_answer = st.button("Check My Answer", use_container_width=True)
+
+with action_col2:
+    get_hint = st.button("Get Hint", use_container_width=True)
+
+with action_col3:
+    reveal_strategy = st.button("Reveal Strategy", use_container_width=True)
+
+with action_col4:
+    show_solution = st.button("Show Step-by-Step Solution", use_container_width=True)
+
+if reveal_strategy:
+    st.session_state.strategy_revealed = True
+
+
+# =========================
+# HINTS
+# =========================
+if get_hint:
+    st.session_state.hint_level += 1
+
+    if st.session_state.hint_level >= 2:
+        st.session_state.strategy_revealed = True
+
+if st.session_state.hint_level > 0:
+    hint_text = (
+        problem.get("hint1", generic_hint_from_problem(problem))
+        if st.session_state.hint_level == 1
+        else problem.get("hint2", generic_hint_from_problem(problem))
+    )
+
+    st.info(hint_text)
+
+    if st.session_state.hint_level >= 2:
+        st.caption("Strategy is now available below.")
+
+
+# =========================
+# ROUNDING HELP
+# =========================
+if rounding_choice != "No rounding instruction":
+    chosen_places = get_rounding_places(rounding_choice)
+
+    st.warning(
+        f"**Instructions on How to Round**\n\n"
+        f"Round your answer to the {decimal_places_plain(chosen_places)} "
+        f"({decimal_places_word(chosen_places)} place).\n\n"
+        f"- Look at the digit to the right.\n"
+        f"- If it is 5 or more, round up.\n"
+        f"- If it is 4 or less, keep the digit the same."
+    )
+
+
+# =========================
+# CHECK ANSWER
+# =========================
+if check_answer:
+    if not user_answer.strip():
+        st.warning("Please type an answer first.")
+    else:
+        is_correct = False
+
+        if problem["type"] == "fraction":
+            is_correct = compare_fraction_answers(user_answer, problem["answer"])
+        else:
+            correct_value = problem["answer"]
+
+            if rounding_choice == "No rounding instruction":
+                is_correct = compare_decimal_answers(user_answer, correct_value)
+            else:
+                places = get_rounding_places(rounding_choice)
+                rounded_correct = float(round_decimal_string(correct_value, places))
+                is_correct = compare_decimal_answers(
+                    user_answer,
+                    rounded_correct,
+                    tolerance=0.0001
+                )
+
+        if is_correct:
+            st.success("Correct! Nice work.")
+
+            if problem["type"] == "fraction":
+                st.write(f"**Simplified answer:** {format_fraction(problem['answer'])}")
+                st.write(f"**Mixed number form (if needed):** {mixed_number_string(problem['answer'])}")
+            else:
+                st.write(f"**Exact answer:** {problem['answer']}")
+                if rounding_choice != "No rounding instruction":
+                    places = get_rounding_places(rounding_choice)
+                    st.write(
+                        f"**Rounded answer:** {round_decimal_string(problem['answer'], places)}"
+                    )
+
+            st.markdown('<div class="ai-box">', unsafe_allow_html=True)
+            st.subheader("Hugging Face AI Tutor")
+            st.write(get_ai_support(problem, "success", rounding_choice))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        else:
+            st.error("Not quite yet.")
+            st.session_state.strategy_revealed = True
+
+            feedback = get_topic_feedback(problem["topic"])
+
+            st.markdown('<div class="feedback-box">', unsafe_allow_html=True)
+            st.subheader("Teacher Feedback")
+            st.write(f"**What to recheck:** {feedback['mistake']}")
+            st.write(f"**Mini-lesson:** {feedback['teach']}")
+            st.write(f"**Try this next:** {feedback['recheck']}")
+            st.write("Strategy has now been revealed to help you try again.")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.write("Also check these questions:")
+            st.write("- Did you use the correct operation?")
+            st.write("- Did you simplify the fraction if needed?")
+            st.write("- Did you round the decimal the way the directions asked?")
+
+            st.markdown('<div class="ai-box">', unsafe_allow_html=True)
+            st.subheader("Hugging Face AI Hint")
+            st.write(get_ai_support(problem, "mistake", rounding_choice))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+
+# =========================
+# SHOW SOLUTION
+# =========================
+if show_solution:
+    st.subheader("Step-by-Step Solution")
+
+    for idx, step in enumerate(problem["steps"], start=1):
+        st.markdown(f"**Step {idx}:** {step}")
+
+    st.markdown("---")
+    st.subheader("Answer")
+
+    if problem["type"] == "fraction":
+        st.write(f"**Simplified fraction:** {format_fraction(problem['answer'])}")
+        st.write(f"**Mixed number form:** {mixed_number_string(problem['answer'])}")
+        st.write(f"**Decimal form:** {round(float(problem['answer']), 3)}")
+    else:
+        st.write(f"**Exact answer:** {problem['answer']}")
+
+        if rounding_choice != "No rounding instruction":
+            places = get_rounding_places(rounding_choice)
+            st.write(
+                f"**Rounded to the {decimal_places_plain(places)} "
+                f"({decimal_places_word(places)} place):** "
+                f"{round_decimal_string(problem['answer'], places)}"
+            )
+
+    st.markdown('<div class="ai-box">', unsafe_allow_html=True)
+    st.subheader("Hugging Face AI Strategy Summary")
+    st.write(get_ai_support(problem, "strategy", rounding_choice))
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# =========================
+# EXTRA PRACTICE
+# =========================
+st.divider()
+st.subheader("Practice Again")
+st.write("Use **Give Me a Similar Problem** for another problem of the same type, or click **Generate New Problem** to keep practicing.")
